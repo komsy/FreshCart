@@ -19,6 +19,9 @@ env:
 jobs:
   build-scan-push:
     runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.IMAGE_TAG }}
+      ecr-registry: ${{ steps.login-ecr.outputs.registry }}
 
     steps:
       - name: Check out code
@@ -38,6 +41,10 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set Image Tag Output
+        id: set-tag
+        run: echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_OUTPUT
+
       - name: Build Docker Image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -47,12 +54,13 @@ jobs:
             -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
             -t $REGISTRY/$ECR_REPOSITORY:latest \
             ./checkout-api
+
       - name: Scan Image with Trivy
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
           format: "table"
-          exit-code: "0"
+          exit-code: "1"
           ignore-unfixed: true
           vuln-type: "os,library"
           severity: "CRITICAL,HIGH"
@@ -64,3 +72,73 @@ jobs:
         run: |
           docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $REGISTRY/$ECR_REPOSITORY:latest
+
+  deploy-staging:
+    needs: build-scan-push
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Staging via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.STAGING_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploying checkout-api ${{ needs.build-scan-push.outputs.image-tag }} to Staging" \
+            --parameters 'commands=[
+              "aws ecr get-login-password --region '${{ env.AWS_REGION }}' | docker login --username AWS --password-stdin '${{ needs.build-scan-push.outputs.ecr-registry }}'",
+              "docker pull '${{ needs.build-scan-push.outputs.ecr-registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-scan-push.outputs.image-tag }}'",
+              "docker stop checkout-api || true",
+              "docker rm checkout-api || true",
+              "docker run -d --name checkout-api --restart always -p 3000:3000 '\''${{ needs.build-scan-push.outputs.ecr-registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-scan-push.outputs.image-tag }}'\''"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Sent SSM Command ID: $COMMAND_ID"
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.STAGING_INSTANCE_ID }}"
+
+  deploy-production:
+    needs: [build-scan-push, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Production via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.PROD_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploying checkout-api ${{ needs.build-scan-push.outputs.image-tag }} to Production" \
+            --parameters 'commands=[
+              "aws ecr get-login-password --region '${{ env.AWS_REGION }}' | docker login --username AWS --password-stdin '${{ needs.build-scan-push.outputs.ecr-registry }}'",
+              "docker pull '${{ needs.build-scan-push.outputs.ecr-registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-scan-push.outputs.image-tag }}'",
+              "docker stop checkout-api || true",
+              "docker rm checkout-api || true",
+              "docker run -d --name checkout-api --restart always -p 3000:3000 '\''${{ needs.build-scan-push.outputs.ecr-registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-scan-push.outputs.image-tag }}'\''"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Sent SSM Command ID: $COMMAND_ID"
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.PROD_INSTANCE_ID }}"
