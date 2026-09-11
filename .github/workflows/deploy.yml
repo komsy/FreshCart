@@ -14,7 +14,7 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  ROLE_TO_ASSUME: arn:aws:iam::906286017981:role/github-actions-ecr-role
+  ROLE_TO_ASSUME: arn:aws:iam::906286017981:role/Github-actions-ecr-role
   ECR_REPOSITORY: checkout-api
 
 jobs:
